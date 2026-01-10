@@ -1,0 +1,9 @@
+env_id: "MiniGrid-Empty-8x8-v0"
+observation_type: "image"  # "image" or "flat"
+max_steps: 100
+render_mode: null  # "human" for visualization, null for training
+
+# Wrapper options
+fully_observable: false
+one_hot_actions: false
+flatten_obs: true

@@ -1,0 +1,21 @@
+agent_type: "active_inference"
+
+# RSSM World Model
+world_model:
+  state_dim: 64
+  hidden_dim: 128
+  action_dim: 7  # MiniGrid discrete actions
+  deterministic_dim: 64
+  stochastic_dim: 32
+  embedding_dim: 128
+
+# EFE Planning
+planning:
+  horizon: 10
+  num_samples: 100
+  temperature: 1.0
+
+# Training
+learning_rate: 0.0003
+gamma: 0.99
+beta_kl: 1.0  # KL divergence weight

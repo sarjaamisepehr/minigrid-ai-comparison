@@ -1,0 +1,16 @@
+agent_type: "actor_critic"
+
+# Network architecture
+network:
+  hidden_dims: [128, 128]
+  activation: "relu"
+
+# Training
+learning_rate: 0.0003
+gamma: 0.99
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+
+# A2C specific
+n_steps: 5  # Steps before update
