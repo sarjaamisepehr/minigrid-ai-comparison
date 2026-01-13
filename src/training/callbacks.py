@@ -93,6 +93,10 @@ class LoggingCallback(Callback):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.start_time = time.time()
         
+        # Reset lists
+        self.episode_rewards = []
+        self.episode_lengths = []
+        
         if self.use_tensorboard:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -108,16 +112,20 @@ class LoggingCallback(Callback):
             self.writer.close()
             
         # Save final metrics
-        elapsed_time = time.time() - self.start_time
-        final_metrics = {
-            "total_episodes": len(self.episode_rewards),
-            "total_time": elapsed_time,
-            "mean_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0,
-            "mean_length": np.mean(self.episode_lengths[-100:]) if self.episode_lengths else 0
-        }
-        
-        with open(self.log_dir / "final_metrics.json", 'w') as f:
-            json.dump(final_metrics, f, indent=2)
+        if self.start_time is not None:
+            elapsed_time = time.time() - self.start_time
+            final_metrics = {
+                "total_episodes": len(self.episode_rewards),
+                "total_time": elapsed_time,
+                "mean_reward": float(np.mean(self.episode_rewards[-100:])) if self.episode_rewards else 0,
+                "mean_length": float(np.mean(self.episode_lengths[-100:])) if self.episode_lengths else 0
+            }
+            
+            try:
+                with open(self.log_dir / "final_metrics.json", 'w') as f:
+                    json.dump(final_metrics, f, indent=2)
+            except Exception as e:
+                print(f"Warning: Could not save final metrics: {e}")
             
     def on_episode_end(
         self,
@@ -140,17 +148,27 @@ class LoggingCallback(Callback):
             std_reward = np.std(recent_rewards)
             mean_length = np.mean(recent_lengths)
             
-            elapsed = time.time() - self.start_time
+            elapsed = time.time() - self.start_time if self.start_time else 0
             eps_per_sec = episode / elapsed if elapsed > 0 else 0
             
             if self.verbose:
-                print(
+                # Base output
+                output = (
                     f"Episode {episode:5d} | "
                     f"Reward: {episode_reward:7.2f} | "
                     f"Mean(100): {mean_reward:7.2f} ± {std_reward:.2f} | "
                     f"Length: {episode_length:4d} | "
                     f"EPS: {eps_per_sec:.2f}"
                 )
+                
+                # Add world model loss if available (Active Inference)
+                if "world_model_loss" in metrics:
+                    wm_loss = metrics["world_model_loss"]
+                    if isinstance(wm_loss, list):
+                        wm_loss = np.mean(wm_loss)
+                    output += f" | WM Loss: {wm_loss:.4f}"
+                    
+                print(output)
                 
             if self.writer is not None:
                 self.writer.add_scalar("episode/reward", episode_reward, episode)
@@ -159,7 +177,10 @@ class LoggingCallback(Callback):
                 self.writer.add_scalar("episode/mean_length_100", mean_length, episode)
                 
                 for key, value in metrics.items():
-                    self.writer.add_scalar(f"train/{key}", value, episode)
+                    if isinstance(value, (int, float)):
+                        self.writer.add_scalar(f"train/{key}", value, episode)
+                    elif isinstance(value, list) and len(value) > 0:
+                        self.writer.add_scalar(f"train/{key}", np.mean(value), episode)
                     
     def on_update(
         self,
@@ -170,7 +191,8 @@ class LoggingCallback(Callback):
         """Log update metrics to TensorBoard."""
         if self.writer is not None:
             for key, value in metrics.items():
-                self.writer.add_scalar(f"update/{key}", value, update)
+                if isinstance(value, (int, float)):
+                    self.writer.add_scalar(f"update/{key}", value, update)
 
 
 class CheckpointCallback(Callback):
@@ -199,6 +221,7 @@ class CheckpointCallback(Callback):
     def on_training_start(self, trainer: 'Trainer') -> None:
         """Create checkpoint directory."""
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.saved_checkpoints = []
         
     def on_episode_end(
         self,
@@ -236,7 +259,7 @@ class EvaluationCallback(Callback):
         self,
         eval_frequency: int = 100,
         n_eval_episodes: int = 10,
-        deterministic: bool = True,
+        deterministic: bool = False,  # Changed to False!
         verbose: bool = True
     ):
         """
@@ -254,6 +277,10 @@ class EvaluationCallback(Callback):
         self.verbose = verbose
         
         self.eval_results: List[Dict[str, float]] = []
+        
+    def on_training_start(self, trainer: 'Trainer') -> None:
+        """Reset evaluation results."""
+        self.eval_results = []
         
     def on_episode_end(
         self,
@@ -286,7 +313,9 @@ class EvaluationCallback(Callback):
         lengths = []
         successes = []
         
-        for _ in range(self.n_eval_episodes):
+        max_steps = trainer.max_steps  # Get max steps from trainer
+        
+        for ep in range(self.n_eval_episodes):
             obs, info = trainer.env.reset()
             
             # Reset agent state if needed
@@ -297,7 +326,7 @@ class EvaluationCallback(Callback):
             episode_length = 0
             done = False
             
-            while not done:
+            while not done and episode_length < max_steps:
                 output = trainer.agent.act(obs, deterministic=self.deterministic)
                 obs, reward, terminated, truncated, info = trainer.env.step(output.action)
                 
@@ -307,21 +336,24 @@ class EvaluationCallback(Callback):
                 
             rewards.append(episode_reward)
             lengths.append(episode_length)
-            # In MiniGrid, reward > 0 typically means success
             successes.append(float(episode_reward > 0))
             
         trainer.agent.train_mode()
         
         return {
-            "mean_reward": np.mean(rewards),
-            "std_reward": np.std(rewards),
-            "mean_length": np.mean(lengths),
-            "success_rate": np.mean(successes)
+            "mean_reward": float(np.mean(rewards)),
+            "std_reward": float(np.std(rewards)),
+            "mean_length": float(np.mean(lengths)),
+            "success_rate": float(np.mean(successes))
         }
     
     def on_training_end(self, trainer: 'Trainer') -> None:
         """Save evaluation results."""
         if self.eval_results:
             results_path = Path(trainer.log_dir) / "eval_results.json"
-            with open(results_path, 'w') as f:
-                json.dump(self.eval_results, f, indent=2)
+            try:
+                results_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(results_path, 'w') as f:
+                    json.dump(self.eval_results, f, indent=2)
+            except Exception as e:
+                print(f"Warning: Could not save eval results: {e}")

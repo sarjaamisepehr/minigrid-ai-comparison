@@ -1,9 +1,5 @@
 """
-Expected Free Energy (EFE) planner for Active Inference.
-
-EFE combines:
-- Pragmatic value: Expected reward/utility
-- Epistemic value: Expected information gain (uncertainty reduction)
+Expected Free Energy (EFE) planner for Active Inference - Simplified Version.
 """
 from typing import Dict, Optional, Tuple
 import torch
@@ -16,20 +12,17 @@ from .world_model import RSSMWorldModel
 
 class EFEPlanner(nn.Module):
     """
-    Expected Free Energy planner for action selection.
+    Simplified Expected Free Energy planner for action selection.
     
-    Evaluates actions based on:
-    G(a) = E[risk] + E[ambiguity] - E[info_gain]
-    
-    Where lower EFE is better (minimizing free energy).
+    Uses 1-step lookahead for speed while maintaining exploration.
     """
     
     def __init__(
         self,
         world_model: RSSMWorldModel,
         action_dim: int,
-        horizon: int = 10,
-        num_samples: int = 50,
+        horizon: int = 1,  # Default to 1-step for speed
+        num_samples: int = 1,
         temperature: float = 1.0,
         gamma: float = 0.99,
         epistemic_weight: float = 1.0
@@ -40,11 +33,11 @@ class EFEPlanner(nn.Module):
         Args:
             world_model: Trained RSSM world model
             action_dim: Number of discrete actions
-            horizon: Planning horizon
-            num_samples: Number of trajectory samples per action
+            horizon: Planning horizon (1 for fast planning)
+            num_samples: Number of trajectory samples (1 for fast planning)
             temperature: Softmax temperature for action selection
-            gamma: Discount factor for future rewards
-            epistemic_weight: Weight for epistemic value (exploration bonus)
+            gamma: Discount factor
+            epistemic_weight: Weight for epistemic value (exploration)
         """
         super().__init__()
         
@@ -56,64 +49,41 @@ class EFEPlanner(nn.Module):
         self.gamma = gamma
         self.epistemic_weight = epistemic_weight
         
-    def compute_efe(
+    def compute_action_values(
         self,
-        state: Dict[str, torch.Tensor],
-        action_sequence: torch.Tensor
+        state: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """
-        Compute Expected Free Energy for action sequence.
+        Compute value for each action using 1-step lookahead.
         
         Args:
-            state: Current state dict
-            action_sequence: (horizon,) tensor of actions
+            state: Current state dict with 'h' and 's'
             
         Returns:
-            EFE value (lower is better)
+            Tensor of action values (higher is better)
         """
         device = state["h"].device
-        batch_size = state["h"].shape[0]
+        action_values = []
         
-        current_state = {
-            "h": state["h"].clone(),
-            "s": state["s"].clone()
-        }
-        
-        total_pragmatic = torch.zeros(batch_size, device=device)
-        total_epistemic = torch.zeros(batch_size, device=device)
-        
-        discount = 1.0
-        
-        for t in range(len(action_sequence)):
-            action = action_sequence[t].expand(batch_size)
-            
-            # Imagine next state
-            next_state = self.world_model.imagine_step(current_state, action)
-            
-            # Pragmatic value: Expected reward
-            predicted_reward = self.world_model.predict_reward(next_state)
-            total_pragmatic += discount * predicted_reward
-            
-            # Epistemic value: State uncertainty (entropy of posterior)
-            # Higher uncertainty = more information to gain = higher epistemic value
-            state_features = self.world_model.get_features(next_state)
-            
-            # Approximate epistemic value using prediction uncertainty
-            # This is a simplification - could use more sophisticated measures
-            obs_pred = self.world_model.decode_observation(next_state)
-            
-            # Uncertainty as variance in predictions (simplified)
-            epistemic = torch.var(state_features, dim=-1)
-            total_epistemic += discount * epistemic
-            
-            current_state = next_state
-            discount *= self.gamma
-            
-        # EFE = -pragmatic_value - epistemic_weight * epistemic_value
-        # (Negative because we want to maximize reward and info gain)
-        efe = -total_pragmatic - self.epistemic_weight * total_epistemic
-        
-        return efe
+        with torch.no_grad():
+            for action in range(self.action_dim):
+                action_tensor = torch.tensor([action], device=device)
+                
+                # Imagine next state
+                next_state = self.world_model.imagine_step(state, action_tensor)
+                
+                # Pragmatic value: Expected reward
+                predicted_reward = self.world_model.predict_reward(next_state)
+                
+                # Epistemic value: Uncertainty in state (simplified)
+                # Use variance of stochastic state as proxy for uncertainty
+                epistemic_value = torch.var(next_state["s"])
+                
+                # Combined value (higher is better)
+                value = predicted_reward + self.epistemic_weight * epistemic_value
+                action_values.append(value.item())
+                
+        return torch.tensor(action_values, device=device)
     
     def plan(
         self,
@@ -121,127 +91,50 @@ class EFEPlanner(nn.Module):
         deterministic: bool = False
     ) -> Tuple[int, Dict[str, float]]:
         """
-        Select action by evaluating EFE for all actions.
-        
-        Uses simple one-step lookahead for efficiency.
-        For longer horizons, samples random action sequences.
+        Select action based on Expected Free Energy.
         
         Args:
             state: Current state dict
-            deterministic: If True, return argmin action
+            deterministic: If True, return argmax action
             
         Returns:
             action: Selected action
             info: Planning information
         """
-        device = state["h"].device
+        # Get action values
+        action_values = self.compute_action_values(state)
         
-        # Evaluate each first action
-        efe_values = []
-        
-        for action in range(self.action_dim):
-            if self.horizon == 1:
-                # Simple one-step lookahead
-                action_tensor = torch.tensor([action], device=device)
-                efe = self.compute_efe(state, action_tensor.unsqueeze(0))
-            else:
-                # Monte Carlo sampling for longer horizons
-                total_efe = torch.zeros(1, device=device)
-                
-                for _ in range(self.num_samples):
-                    # Random action sequence starting with current action
-                    action_seq = torch.randint(
-                        0, self.action_dim, 
-                        (self.horizon,), 
-                        device=device
-                    )
-                    action_seq[0] = action
-                    
-                    efe = self.compute_efe(state, action_seq)
-                    total_efe += efe
-                    
-                efe = total_efe / self.num_samples
-                
-            efe_values.append(efe.item())
-            
-        efe_tensor = torch.tensor(efe_values, device=device)
-        
-        # Convert EFE to action probabilities (lower EFE = higher prob)
-        # Note: negative because lower EFE is better
-        action_probs = F.softmax(-efe_tensor / self.temperature, dim=0)
+        # Convert to probabilities
+        action_probs = F.softmax(action_values / self.temperature, dim=0)
         
         if deterministic:
-            action = efe_tensor.argmin().item()
+            action = action_values.argmax().item()
         else:
             dist = Categorical(action_probs)
             action = dist.sample().item()
             
         info = {
-            "efe_values": efe_values,
+            "action_values": action_values.cpu().numpy().tolist(),
             "action_probs": action_probs.cpu().numpy().tolist(),
-            "min_efe": min(efe_values),
-            "max_efe": max(efe_values)
+            "max_value": action_values.max().item(),
+            "min_value": action_values.min().item()
         }
         
         return action, info
 
 
-class PolicyNetwork(nn.Module):
-    """
-    Learned policy network for Active Inference.
+class RandomPlanner:
+    """Simple random action selection for debugging."""
     
-    Can be trained via policy gradient to match EFE-optimal actions,
-    providing faster action selection at deployment.
-    """
-    
-    def __init__(
+    def __init__(self, action_dim: int):
+        self.action_dim = action_dim
+        
+    def plan(
         self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dim: int = 256
-    ):
-        """
-        Initialize policy network.
-        
-        Args:
-            state_dim: Dimension of state features
-            action_dim: Number of discrete actions
-            hidden_dim: Hidden layer dimension
-        """
-        super().__init__()
-        
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-        
-    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
-        """Compute action logits."""
-        return self.network(state_features)
-    
-    def get_action(
-        self,
-        state_features: torch.Tensor,
+        state: Dict[str, torch.Tensor],
         deterministic: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample action from policy.
-        
-        Returns:
-            action: Selected action
-            log_prob: Log probability
-        """
-        logits = self.forward(state_features)
-        dist = Categorical(logits=logits)
-        
-        if deterministic:
-            action = logits.argmax(dim=-1)
-        else:
-            action = dist.sample()
-            
-        log_prob = dist.log_prob(action)
-        
-        return action, log_prob
+    ) -> Tuple[int, Dict[str, float]]:
+        """Select random action."""
+        import random
+        action = random.randint(0, self.action_dim - 1)
+        return action, {"method": "random"}

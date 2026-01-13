@@ -45,13 +45,16 @@ class ReplayBuffer:
         self.action_dim = action_dim
         self.discrete_actions = discrete_actions
         
+        # Flatten observation shape for storage
+        self.flat_obs_dim = int(np.prod(observation_shape))
+        
         # Pre-allocate arrays for efficiency
         self.observations = np.zeros(
-            (capacity, *observation_shape), 
+            (capacity, self.flat_obs_dim), 
             dtype=np.float32
         )
         self.next_observations = np.zeros(
-            (capacity, *observation_shape),
+            (capacity, self.flat_obs_dim),
             dtype=np.float32
         )
         
@@ -84,10 +87,11 @@ class ReplayBuffer:
             next_observation: Next observation
             done: Whether episode ended
         """
-        self.observations[self.position] = observation
+        # Flatten observations
+        self.observations[self.position] = observation.flatten()
+        self.next_observations[self.position] = next_observation.flatten()
         self.actions[self.position] = action
         self.rewards[self.position] = reward
-        self.next_observations[self.position] = next_observation
         self.dones[self.position] = float(done)
         
         self.position = (self.position + 1) % self.capacity
@@ -159,7 +163,7 @@ class SequenceReplayBuffer:
         capacity: int,
         observation_shape: Tuple[int, ...],
         action_dim: int,
-        sequence_length: int = 50,
+        sequence_length: int = 20,
         discrete_actions: bool = True
     ):
         """
@@ -174,6 +178,7 @@ class SequenceReplayBuffer:
         """
         self.capacity = capacity
         self.observation_shape = observation_shape
+        self.flat_obs_dim = int(np.prod(observation_shape))
         self.action_dim = action_dim
         self.sequence_length = sequence_length
         self.discrete_actions = discrete_actions
@@ -183,6 +188,9 @@ class SequenceReplayBuffer:
         
         # Current episode being collected
         self._current_episode: Dict[str, List] = self._new_episode()
+        
+        # Debug counters
+        self._total_transitions = 0
         
     def _new_episode(self) -> Dict[str, List]:
         """Create empty episode storage."""
@@ -209,17 +217,23 @@ class SequenceReplayBuffer:
             reward: Reward received
             done: Whether episode ended
         """
-        self._current_episode["observations"].append(observation)
+        # Flatten observation
+        flat_obs = observation.flatten().astype(np.float32)
+        
+        self._current_episode["observations"].append(flat_obs)
         self._current_episode["actions"].append(action)
         self._current_episode["rewards"].append(reward)
         self._current_episode["dones"].append(done)
+        self._total_transitions += 1
         
         if done:
             self._store_episode()
             
     def _store_episode(self) -> None:
         """Store completed episode and start new one."""
-        if len(self._current_episode["observations"]) > 0:
+        ep_len = len(self._current_episode["observations"])
+        
+        if ep_len > 0:
             episode = {
                 "observations": np.array(
                     self._current_episode["observations"],
@@ -250,7 +264,9 @@ class SequenceReplayBuffer:
     def end_episode(self) -> None:
         """Manually end current episode (e.g., on truncation)."""
         if len(self._current_episode["observations"]) > 0:
-            self._current_episode["dones"][-1] = True
+            # Mark last transition as done
+            if self._current_episode["dones"]:
+                self._current_episode["dones"][-1] = True
             self._store_episode()
     
     def sample(
@@ -275,25 +291,44 @@ class SequenceReplayBuffer:
         ]
         
         if len(valid_episodes) == 0:
-            raise ValueError(
-                f"No episodes with length >= {self.sequence_length}. "
-                f"Have {len(self.episodes)} episodes."
-            )
+            # If no episodes are long enough, use shorter sequences from available episodes
+            if len(self.episodes) > 0:
+                max_available = max(len(ep["observations"]) for ep in self.episodes)
+                if max_available >= 2:
+                    # Temporarily reduce sequence length
+                    temp_seq_len = min(self.sequence_length, max_available)
+                    valid_episodes = [
+                        ep for ep in self.episodes 
+                        if len(ep["observations"]) >= temp_seq_len
+                    ]
+                    actual_seq_len = temp_seq_len
+                else:
+                    raise ValueError(
+                        f"No usable episodes. Have {len(self.episodes)} episodes, "
+                        f"max length {max_available}, need at least 2."
+                    )
+            else:
+                raise ValueError("No episodes in buffer.")
+        else:
+            actual_seq_len = self.sequence_length
+        
+        # Adjust batch size if needed
+        effective_batch_size = min(batch_size, len(valid_episodes))
         
         batch_obs = []
         batch_actions = []
         batch_rewards = []
         batch_dones = []
         
-        for _ in range(batch_size):
+        for _ in range(effective_batch_size):
             # Sample random episode
             ep_idx = np.random.randint(0, len(valid_episodes))
             episode = valid_episodes[ep_idx]
             
             # Sample random starting point
-            max_start = len(episode["observations"]) - self.sequence_length
+            max_start = len(episode["observations"]) - actual_seq_len
             start_idx = np.random.randint(0, max_start + 1)
-            end_idx = start_idx + self.sequence_length
+            end_idx = start_idx + actual_seq_len
             
             batch_obs.append(episode["observations"][start_idx:end_idx])
             batch_actions.append(episode["actions"][start_idx:end_idx])
@@ -333,8 +368,30 @@ class SequenceReplayBuffer:
     
     def is_ready(self, batch_size: int) -> bool:
         """Check if buffer has enough sequences to sample."""
-        valid_episodes = sum(
-            1 for ep in self.episodes 
-            if len(ep["observations"]) >= self.sequence_length
+        if len(self.episodes) == 0:
+            return False
+        # Need at least 1 episode with enough length
+        return any(
+            len(ep["observations"]) >= min(self.sequence_length, 10)
+            for ep in self.episodes
         )
-        return valid_episodes >= batch_size
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get buffer statistics for debugging."""
+        if len(self.episodes) == 0:
+            return {
+                "num_episodes": 0,
+                "total_transitions": 0,
+                "min_episode_length": 0,
+                "max_episode_length": 0,
+                "valid_episodes": 0
+            }
+        
+        lengths = [len(ep["observations"]) for ep in self.episodes]
+        return {
+            "num_episodes": len(self.episodes),
+            "total_transitions": sum(lengths),
+            "min_episode_length": min(lengths),
+            "max_episode_length": max(lengths),
+            "valid_episodes": sum(1 for l in lengths if l >= self.sequence_length)
+        }
